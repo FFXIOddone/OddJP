@@ -1,11 +1,12 @@
 -- oddjp.lua
 -- Ashita v4 Addon: OddJP — Party chat translator to Japanese
--- v1.3.5 (instrumented)
--- Adds HTTP status/body head/hex logging around curl calls to pinpoint failures.
+-- v1.4.1
+-- Fix: harden is_kana_only against FFXI autotranslate tokens / bad bytes; skip auto-translate braces.
+-- Also: safer UTF-8 normalization; contains_japanese never true on decode errors.
 
 addon.name = 'oddjp';
 addon.author = 'Oddone';
-addon.version = '1.3.5';
+addon.version = '1.4.1';
 addon.desc = 'Chat translator to Japanese (Ashita v4).';
 addon.link = '';
 
@@ -14,6 +15,7 @@ require('common')
 local chat     = require('chat')
 local settings = require('settings')
 local ffi      = require('ffi')
+local bit      = require('bit')
 
 -- ========== Defaults ==========
 local defaults = {
@@ -26,8 +28,8 @@ local defaults = {
     send_encoding = 'sjis',     -- 'sjis' (recommended) or 'utf8'
     default_channel = 'p',      -- default output channel (p/s/l/l2/a)
     translate_incoming = true,  -- translate incoming JP messages
-    hiragana_mode = false,      -- convert kanji to hiragana before translation
-    translate_modes = {         -- chat modes to translate
+    hiragana_mode = false,      -- (outbound EN->JA) katakana→hiragana normalize
+    translate_modes = {         -- chat modes to translate (incoming filter)
         [4]  = true,  -- say
         [5]  = true,  -- shout
         [3]  = true,  -- tell
@@ -35,37 +37,13 @@ local defaults = {
         [14] = true,  -- linkshell2
         [0x17] = true,-- party
         [8]  = true   -- emote
-    }
+    },
+    -- Optional: Furigana (hiragana-only) logger for incoming JP
+    furigana = { enabled = false, provider = 'goo', app_id = '' }
 }
 
 local cfg = settings.load(defaults)
 settings.register('settings', 'settings_update', function(s) if s then for k,v in pairs(s) do cfg[k]=v end end end)
-
--- ========== UTF-8 presence / detection ==========
-local has_utf8_lib = (type(utf8) == 'table' and type(utf8.codes) == 'function')
-
-local function contains_japanese(text)
-    if not text or text == '' then return false end
-    if has_utf8_lib then
-        local ok, res = pcall(function()
-            for _, cp in utf8.codes(text) do
-                if (cp >= 0x3040 and cp <= 0x309F) -- hiragana
-                or (cp >= 0x30A0 and cp <= 0x30FF) -- katakana
-                or (cp >= 0x4E00 and cp <= 0x9FFF) -- CJK
-                or (cp >= 0xFF66 and cp <= 0xFF9D) -- halfwidth katakana
-                or (cp == 0x30FC) then            -- ー
-                    return true
-                end
-            end
-            return false
-        end)
-        if ok then return res else return true end
-    else
-        if text:match('[\227-\238][\128-\191][\128-\191]') then return true end
-        if text:match('[\192-\255]') then return true end
-        return false
-    end
-end
 
 -- ========== FFI: UTF-8 <-> CP932 ==========
 ffi.cdef[[
@@ -78,57 +56,78 @@ int WideCharToMultiByte(unsigned int CodePage, unsigned long dwFlags,
                         const char* lpDefaultChar, int* lpUsedDefaultChar);
 ]]
 local CP_UTF8, CP_932 = 65001, 932
+
+local function to_wide(codepage, s)
+    if s == nil then return nil, 0 end
+    local n = ffi.C.MultiByteToWideChar(codepage, 0, s, #s, nil, 0); if n == 0 then return nil, 0 end
+    local buf = ffi.new('wchar_t[?]', n)
+    if ffi.C.MultiByteToWideChar(codepage, 0, s, #s, buf, n) == 0 then return nil, 0 end
+    return buf, n
+end
+local function from_wide(codepage, wbuf, wlen)
+    if not wbuf or wlen == 0 then return nil end
+    local m = ffi.C.WideCharToMultiByte(codepage, 0, wbuf, wlen, nil, 0, nil, nil); if m == 0 then return nil end
+    local mb = ffi.new('char[?]', m)
+    if ffi.C.WideCharToMultiByte(codepage, 0, wbuf, wlen, mb, m, nil, nil) == 0 then return nil end
+    return ffi.string(mb, m)
+end
+
 local function utf8_to_cp932(s)
-    if not s or s == '' then return s end
-    local wlen = ffi.C.MultiByteToWideChar(CP_UTF8, 0, s, #s, nil, 0); if wlen == 0 then return s end
-    local wbuf = ffi.new('wchar_t[?]', wlen)
-    if ffi.C.MultiByteToWideChar(CP_UTF8, 0, s, #s, wbuf, wlen) == 0 then return s end
-    local mblen = ffi.C.WideCharToMultiByte(CP_932, 0, wbuf, wlen, nil, 0, nil, nil); if mblen == 0 then return s end
-    local mbuf  = ffi.new('char[?]', mblen)
-    if ffi.C.WideCharToMultiByte(CP_932, 0, wbuf, wlen, mbuf, mblen, nil, nil) == 0 then return s end
-    return ffi.string(mbuf, mblen)
+    if type(s) ~= 'string' then s = tostring(s or '') end
+    if s == '' then return s end
+    local wbuf, wlen = to_wide(CP_UTF8, s); if not wbuf then return s end
+    local out = from_wide(CP_932, wbuf, wlen); return out or s
+end
+
+local function cp932_to_utf8(s)
+    if type(s) ~= 'string' then s = tostring(s or '') end
+    if s == '' then return s end
+    local wbuf, wlen = to_wide(CP_932, s); if not wbuf then return s end
+    local out = from_wide(CP_UTF8, wbuf, wlen); return out or s
+end
+
+-- If s is valid UTF-8, return as-is; otherwise assume CP932 and convert to UTF-8.
+local function ensure_utf8(s)
+    if s == nil then return '' end
+    if type(s) ~= 'string' then s = tostring(s) end
+    if s == '' then return s end
+    local wbuf = select(1, to_wide(CP_UTF8, s))
+    if wbuf then return s end
+    return cp932_to_utf8(s)
 end
 
 -- ========== Channels ==========
 local valid_channels = { s=true, t=true, l=true, l2=true, p=true, a=true }
 
 -- ========== Utils / Logging ==========
-local function trim(s) return (s and s:gsub('^%s+',''):gsub('%s+$','')) or '' end
-local function starts_with_ci(s,p) return s:sub(1,#p):lower()==p:lower() end
-local function info(m) print(chat.header(addon.name):append(chat.message(m and tostring(m) or ''))) end
+local function trim(s) if type(s) ~= 'string' then return '' end return (s:gsub('^%s+',''):gsub('%s+$','')) end
+local function starts_with_ci(s,p) return type(s)=='string' and s:sub(1,#p):lower()==p:lower() end
 
-local function format_output(m)
+-- Chat log out as CP932 (so JP appears in parsed logs too)
+local function to_chatlog(m)
     local s = tostring(m or '')
-    if cfg.send_encoding == 'sjis' then return utf8_to_cp932(s) else return s end
+    local as_utf8 = ensure_utf8(s)
+    return utf8_to_cp932(as_utf8)
 end
-
-local function dbg(m)
-    if not cfg.debug then return end
-    print(chat.header(addon.name):append(chat.message('[debug] '..format_output(m))))
-end
-
-local function dbg_raw(m)
-    if not cfg.debug then return end
-    print(chat.header(addon.name):append(chat.message('[debug] '..tostring(m))))
-end
+local function info(m) print(chat.header(addon.name):append(chat.message(to_chatlog(m)))) end
+local function dbg(m) if cfg.debug then print(chat.header(addon.name):append(chat.message(to_chatlog('[debug] '..tostring(m))))) end end
+local function dbg_raw(m) if cfg.debug then print(chat.header(addon.name):append(chat.message(to_chatlog('[debug] '..tostring(m))))) end end
 
 local function urlencode(str)
-    if not str then return '' end
+    if type(str) ~= 'string' then return '' end
     str=str:gsub('\n','\r\n')
     str=str:gsub('([^%w%-_%.~ ])', function(c) return string.format('%%%02X', string.byte(c)) end)
     return str:gsub(' ','%%20')
 end
 
--- original exec (kept for non-HTTP uses)
+-- ========== Exec helpers ==========
 local function exec(cmd)
     local f = io.popen(cmd..' 2>nul','r'); if not f then return nil end
     local s = f:read('*a'); f:close(); if s and #s>0 then return s end
     return nil
 end
 
--- ========== Instrumented HTTP exec ==========
 local function http_exec(cmd)
-    -- write CURL_HTTP_CODE trailer we can parse
     local full = cmd .. ' -w "\\nCURL_HTTP_CODE=%{http_code}\\n"'
     local f = io.popen(full .. ' 2>nul', 'r'); if not f then return nil, 0 end
     local out = f:read('*a') or ''; f:close()
@@ -138,6 +137,7 @@ local function http_exec(cmd)
 end
 
 local function hex_preview(s, n)
+    if type(s) ~= 'string' then return '' end
     n = math.min(#s, n or 128)
     local t = {}
     for i = 1, n do t[#t+1] = string.format('%02X', s:byte(i)) end
@@ -222,7 +222,7 @@ do
 end
 
 local function unescape_json(s)
-    if not s then return s end
+    if type(s) ~= 'string' then return s end
     s=s:gsub('\\/','/'):gsub('\\"','"'):gsub("\\'","'"):gsub('\\\\','\\')
        :gsub('\\n','\n'):gsub('\\r','\r'):gsub('\\t','\t')
     s=s:gsub('\\u(%x%x%x%x)', function(hex)
@@ -234,84 +234,48 @@ local function unescape_json(s)
     return s
 end
 
--- ========== Helpers to pick a string out of unknown JSON ==========
-local function is_mostly_ascii(str)
-    if not str or #str == 0 then return false end
-    local ascii, other = 0, 0
-    for i=1,#str do local b=str:byte(i); if b>=32 and b<=126 then ascii=ascii+1 else other=other+1 end end
-    if ascii == 0 then return false end
-    return (ascii / (ascii + other)) >= 0.6
+-- ========== Helpers ==========
+local function strip_ashita_codes(s)
+    if type(s) ~= 'string' then return '' end
+    s = s:gsub('\30%d',''):gsub('\31%d','')
+    s = s:gsub('[\0\1\2\3\4\5\6\7\8\11\12\14-\31]', '')
+    return s
 end
 
-local function find_best_string(obj)
-    if type(obj) ~= 'table' and type(obj) ~= 'string' then return nil end
-
-    local first_found = nil
-    local best, best_score = nil, -1
-    local seen = setmetatable({}, { __mode = 'k' })
-    local priority_keys = {
-        translatedText = true, text = true, translation = true, translated = true,
-        output = true, target = true, result = true, message = true
-    }
-
-    local function has_letters(s) return s:match('[A-Za-z]') ~= nil end
-
-    local function score(s, key)
-        if type(s) ~= 'string' or #s == 0 then return -1 end
-        local sc = 0
-        if is_mostly_ascii and is_mostly_ascii(s) then sc = sc + 50 else sc = sc + 5 end
-        if has_letters(s) then sc = sc + 20 end
-        local len = #s
-        if len >= 2 and len <= 240 then sc = sc + 20 end
-        if key and priority_keys[key] then sc = sc + 40 end
-        if s:match('^%s*[%[%{<]') and not s:match('[A-Za-z]') then sc = sc - 10 end
-        return sc
-    end
-
-    local function consider(s, key)
-        if not first_found then first_found = s end
-        local sc = score(s, key)
-        if sc > best_score then best, best_score = s, sc end
-    end
-
-    local function walk(v, key, depth)
-        if depth > 8 then return end
-        local tv = type(v)
-        if tv == 'string' then
-            consider(v, key)
-        elseif tv == 'table' then
-            if seen[v] then return end
-            seen[v] = true
-
-            -- Fast-path for Google translate_a/single: [[{"translated","orig",..},...],...]
-            if v[1] and type(v[1]) == 'table' and v[1][1] and type(v[1][1]) == 'table' and type(v[1][1][1]) == 'string' then
-                consider(v[1][1][1], 'translatedText')
-            end
-
-            -- Array-like entries first (preserve typical ordering)
-            local n = #v
-            for i = 1, n do walk(v[i], nil, depth + 1) end
-            -- Then map-like entries (string keys)
-            for k, nv in pairs(v) do
-                if type(k) ~= 'number' then walk(nv, tostring(k), depth + 1) end
-            end
-        end
-    end
-
-    if type(obj) == 'string' then consider(obj, nil) else walk(obj, nil, 1) end
-    return best or first_found
+-- FFXI autotranslate tokens are commonly shown as { ... } in logs; skip special handling on those lines.
+local function looks_like_ffxi_autotranslate(s)
+    if type(s) ~= 'string' then return false end
+    if s:find('%b{}') then return true end
+    return false
 end
 
-
--- ========== Temp file helper ==========
-local function write_temp_utf8(text)
-    local base = os.getenv('TEMP') or os.getenv('TMP') or '.'
-    local path = (base .. '\\oddjp_q.txt'):gsub('/', '\\')
-    local f = io.open(path, 'wb')
-    if not f then return nil end
-    f:write(text or '')
-    f:close()
-    return path
+-- ========== UTF-8 presence / detection ==========
+local has_utf8_lib = (type(utf8) == 'table' and type(utf8.codes) == 'function')
+local function contains_japanese(text)
+    local s = ensure_utf8(text or '')
+    if s == '' then return false end
+    if has_utf8_lib then
+        local ok, res = pcall(function()
+            for _, cp in utf8.codes(s) do
+                if (cp >= 0x3040 and cp <= 0x309F) -- hiragana
+                or (cp >= 0x30A0 and cp <= 0x30FF) -- katakana
+                or (cp >= 0x4E00 and cp <= 0x9FFF) -- CJK
+                or (cp >= 0xFF66 and cp <= 0xFF9D) -- halfwidth katakana
+                or (cp == 0x30FC) then            -- ー
+                    return true
+                end
+            end
+            return false
+        end)
+        return ok and res or false
+    else
+        local ok, res = pcall(function()
+            if s:match('[\227-\238][\128-\191][\128-\191]') then return true end
+            if s:match('[\192-\255]') then return true end
+            return false
+        end)
+        return ok and res or false
+    end
 end
 
 -- ========== Kana → Romaji (small mapper) ==========
@@ -335,7 +299,7 @@ local kana_map = {
 local small_map = {['ャ']='ya',['ュ']='yu',['ョ']='yo',['ァ']='a',['ィ']='i',['ゥ']='u',['ェ']='e',['ォ']='o',['ッ']='tsu'}
 
 local function kana_to_romaji(s)
-    if not s then return s end
+    if type(s) ~= 'string' then return '' end
     local out = {}
     local i, len = 1, #s
     while i <= len do
@@ -358,25 +322,81 @@ local function kana_to_romaji(s)
     return table.concat(out)
 end
 
+-- Hardened: never return nil; guard autotranslate braces.
 local function is_kana_only(s)
-    if not s or s == '' then return false end
+    if type(s) ~= 'string' then return false end
+    if s == '' then return false end
+    if looks_like_ffxi_autotranslate(s) then return false end
+    local u = ensure_utf8(s)
+    if u == '' then return false end
     if has_utf8_lib then
         local ok, res = pcall(function()
-            for _, cp in utf8.codes(s) do
+            for _, cp in utf8.codes(u) do
                 if not ((cp >= 0x3040 and cp <= 0x309F) or (cp >= 0x30A0 and cp <= 0x30FF) or (cp >= 0xFF66 and cp <= 0xFF9D) or cp == 0x30FC) then
                     return false
                 end
             end
             return true
         end)
-        return ok and res
+        if not ok then return false end
+        return res and true or false
     else
-        if s:match('%w') then return false end
-        return s:match('[\192-\255]') ~= nil
+        local ok, res = pcall(function()
+            if u:match('%w') then return false end
+            return u:match('[\192-\255]') ~= nil
+        end)
+        if not ok then return false end
+        return res and true or false
     end
 end
 
--- ========== Phrasebook ==========
+-- ========== Katakana→Hiragana (offline) ==========
+local function u8_encode(cp)
+    if cp < 0x80 then
+        return string.char(cp)
+    elseif cp < 0x800 then
+        return string.char(0xC0 + bit.rshift(cp,6),
+                           0x80 + bit.band(cp,0x3F))
+    elseif cp < 0x10000 then
+        return string.char(0xE0 + bit.rshift(cp,12),
+                           0x80 + bit.band(bit.rshift(cp,6),0x3F),
+                           0x80 + bit.band(cp,0x3F))
+    else
+        return "\239\191\189" -- U+FFFD
+    end
+end
+
+local function katakana_to_hiragana(s)
+    local str = ensure_utf8(s or '')
+    if str == '' then return str end
+    local out = {}
+    local i, n = 1, #str
+    while i <= n do
+        local b1 = str:byte(i)
+        if not b1 then break end
+        if b1 < 0x80 then
+            out[#out+1] = string.char(b1); i = i + 1
+        elseif b1 < 0xE0 and i+1 <= n then
+            local b2 = str:byte(i+1)
+            local cp = bit.lshift(bit.band(b1,0x1F),6) + bit.band(b2,0x3F)
+            out[#out+1] = u8_encode(cp); i = i + 2
+        elseif b1 < 0xF0 and i+2 <= n then
+            local b2, b3 = str:byte(i+1), str:byte(i+2)
+            local cp = bit.lshift(bit.band(b1,0x0F),12)
+                    + bit.lshift(bit.band(b2,0x3F),6)
+                    + bit.band(b3,0x3F)
+            if cp >= 0x30A1 and cp <= 0x30F6 then
+                cp = cp - 0x60
+            end
+            out[#out+1] = u8_encode(cp); i = i + 3
+        else
+            out[#out+1] = string.char(b1); i = i + 1
+        end
+    end
+    return table.concat(out)
+end
+
+-- ========== Phrasebook (outbound helper) ==========
 local phrasebook = {
     ["hello"]="こんにちは",["hi"]="やあ",["good morning"]="おはよう",["good night"]="おやすみ",
     ["thank you"]="ありがとう",["thanks"]="ありがとう",["ty"]="ありがとう",["tyty"]="ありがとう！",
@@ -389,7 +409,7 @@ local phrasebook = {
     ["hooray"]="やったー！",["yay"]="やったー！",["woohoo"]="やったー！",
 }
 local function phrasebook_match(s)
-    local ls = (s or ''):lower()
+    local ls = (type(s)=='string' and s or ''):lower()
     if phrasebook[ls] then return phrasebook[ls] end
     local stripped = ls:gsub('[%p%s]+$', '')
     if phrasebook[stripped] then return phrasebook[stripped] end
@@ -402,28 +422,47 @@ local function phrasebook_match(s)
 end
 local function naive_fallback(text) return string.format("「%s」", text) end
 
--- ========== Cleaning ==========
+-- ========== Cleaning / To-send ==========
 local function remove_hex_artifacts(s)
-    if not s then return '' end
-    s = s:gsub('%s*[%x][%x%s]+$', '') -- trailing hex-ish junk
+    if type(s) ~= 'string' then return '' end
+    s = s:gsub('%s*[%x][%x%s]+$', '')
     s = s:gsub('%s+', ' ')
     return s
 end
 
 local function sanitize_lines(s)
-    if not s then return '' end
+    if type(s) ~= 'string' then return '' end
     s = s:gsub('[\r\n]', ' ')
          :gsub('[\0\1\2\3\4\5\6\7\8\11\12\14-\31]', '')
          :gsub('%s+', ' ')
     return remove_hex_artifacts(s)
 end
+
 local function to_send(s)
     s = sanitize_lines(s)
     if cfg.send_encoding == 'sjis' then return utf8_to_cp932(s) else return s end
 end
 
+-- ========== Temp writers ==========
+local function write_temp_utf8(text)
+    local base = os.getenv('TEMP') or os.getenv('TMP') or '.'
+    local path = (base .. '\\oddjp_q.txt'):gsub('/', '\\')
+    local f = io.open(path, 'wb'); if not f then return nil end
+    f:write(text or '')
+    f:close()
+    return path
+end
+local function write_temp_json(text)
+    local base = os.getenv('TEMP') or os.getenv('TMP') or '.'
+    local path = (base .. '\\oddjp_q.json'):gsub('/', '\\')
+    local f = io.open(path, 'wb'); if not f then return nil end
+    f:write(text or '')
+    f:close()
+    return path
+end
+
 -- ========== Google EN->JA ==========
-local function translate_google(text)
+local function translate_google_en_to_ja(text)
     local qfile = write_temp_utf8(text)
     if not qfile then return nil, 'tmpfile' end
     local base = 'https://translate.googleapis.com/translate_a/single'
@@ -450,7 +489,18 @@ local function translate_google(text)
     if ok and parsed and type(parsed) == 'table' then
         local primary = parsed[1] and parsed[1][1] and parsed[1][1][1]
         if type(primary) == 'string' then return remove_hex_artifacts(primary), nil end
-        local candidate = find_best_string(parsed); if candidate then return remove_hex_artifacts(candidate), nil end
+        local function walk(v)
+            if type(v)=='string' then return v end
+            if type(v)~='table' then return nil end
+            if v[1] and type(v[1])=='table' and v[1][1] and type(v[1][1])=='table' and type(v[1][1][1])=='string' then
+                return v[1][1][1]
+            end
+            for i=1,#v do local r=walk(v[i]); if r then return r end end
+            for _,nv in pairs(v) do local r=walk(nv); if r then return r end end
+            return nil
+        end
+        local candidate = walk(parsed)
+        if candidate then return remove_hex_artifacts(candidate), nil end
     end
     local parts = {}; for translated,_ in out:gmatch('%["(.-)","(.-)"') do parts[#parts+1]=translated end
     if #parts == 0 then return nil, 'parse' end
@@ -458,7 +508,7 @@ local function translate_google(text)
 end
 
 -- ========== DeepL EN->JA ==========
-local function translate_deepl(text)
+local function translate_deepl_en_to_ja(text)
     if cfg.api_key=='' then return nil,'no_key' end
     local data='auth_key='..urlencode(cfg.api_key)..'&text='..urlencode(text)..'&source_lang=EN&target_lang=JA'
     local cmd = 'curl -s -X POST --retry 2 --max-time 10 -H "Content-Type: application/x-www-form-urlencoded" -d "'..data..'" "https://api-free.deepl.com/v2/translate"'
@@ -478,12 +528,77 @@ local function translate_deepl(text)
 end
 
 -- ========== JA->EN ==========
-local function translate_ja_to_en(text)
-    if not text then return nil, 'empty' end
-    text = trim(text)
-    if text == '' then return nil, 'empty' end
+local function translate_google_ja_to_en(text)
+    local qfile = write_temp_utf8(text)
+    if not qfile then return nil, 'tmpfile' end
+    local base = 'https://translate.googleapis.com/translate_a/single'
+    local cmd = table.concat({
+        'curl -s -G --retry 2 --max-time 8',
+        '"'..base..'"',
+        '--data-urlencode "client=gtx"',
+        '--data-urlencode "sl=ja"',
+        '--data-urlencode "tl=en"',
+        '--data-urlencode "dt=t"',
+        '--data-urlencode "q@'..qfile..'"'
+    }, ' ')
+    if cfg.debug then dbg('JA->EN executing curl (google)') end
+    local out, code = http_exec(cmd)
+    os.remove(qfile)
+    if cfg.debug then
+        dbg(string.format('google JA->EN http=%d', code))
+        dbg_raw('google JA->EN head: '..tostring(out or ''):sub(1,200))
+        if out and #out>0 then dbg_raw('google JA->EN hex:  '..hex_preview(out, 64)) end
+    end
+    if not out then return nil,'curl' end
+    if code ~= 200 or out == '' then return nil, 'http_'..tostring(code) end
+    out = unescape_json(out)
+    local ok, parsed = pcall(function() return json.decode(out) end)
+    if ok and parsed and type(parsed) == 'table' then
+        local primary = parsed[1] and parsed[1][1] and parsed[1][1][1]
+        if type(primary) == 'string' then return remove_hex_artifacts(primary), nil end
+        local function find(v)
+            if type(v)=='string' then return v end
+            if type(v)~='table' then return nil end
+            if v[1] and type(v[1])=='table' and v[1][1] and type(v[1][1])=='table' and type(v[1][1][1])=='string' then
+                return v[1][1][1]
+            end
+            for i=1,#v do local r=find(v[i]); if r then return r end end
+            for _,nv in pairs(v) do local r=find(nv); if r then return r end end
+            return nil
+        end
+        local candidate = find(parsed)
+        if candidate then return remove_hex_artifacts(candidate), nil end
+        return nil, 'parse'
+    end
+    local parts = {}; for translated,_ in out:gmatch('%["(.-)","(.-)"') do parts[#parts+1]=translated end
+    if #parts == 0 then return nil, 'parse' end
+    return remove_hex_artifacts(table.concat(parts, '')), nil
+end
 
-    if #text < 12 and is_kana_only(text) then
+local function translate_deepl_ja_to_en(text)
+    if cfg.api_key == '' then return nil, 'no_key' end
+    local data = 'auth_key='..urlencode(cfg.api_key)..'&text='..urlencode(text)..'&source_lang=JA&target_lang=EN'
+    local cmd = 'curl -s -X POST --retry 2 --max-time 10 -H "Content-Type: application/x-www-form-urlencoded" -d "'..data..'" "https://api-free.deepl.com/v2/translate"'
+    local out, code = http_exec(cmd)
+    if cfg.debug then
+        dbg(string.format('deepl JA->EN http=%d', code))
+        dbg_raw('deepl JA->EN head: '..tostring(out or ''):sub(1,200))
+        if out and #out>0 then dbg_raw('deepl JA->EN hex:  '..hex_preview(out, 64)) end
+    end
+    if not out then return nil, 'curl' end
+    if code ~= 200 or out == '' then return nil, 'http_'..tostring(code) end
+    out = unescape_json(out)
+    local t = out:match('%"text%":%s*%"(.-)%"')
+    if not t or #t == 0 then return nil, 'parse' end
+    return remove_hex_artifacts(t), nil
+end
+
+local function translate_ja_to_en(text_utf8)
+    if not text_utf8 then return nil, 'empty' end
+    local text = trim(text_utf8); if text == '' then return nil, 'empty' end
+
+    -- Skip kana-heuristic on FFXI autotranslate tokens
+    if #text < 12 and not looks_like_ffxi_autotranslate(text) and is_kana_only(text) then
         local rom = kana_to_romaji(text)
         if rom and #rom > 0 then
             if cfg.debug then dbg('kana-only short, romaji='..tostring(rom)) end
@@ -492,65 +607,9 @@ local function translate_ja_to_en(text)
     end
 
     if cfg.provider == 'google' then
-        local qfile = write_temp_utf8(text)
-        if not qfile then return nil, 'tmpfile' end
-        local base = 'https://translate.googleapis.com/translate_a/single'
-        local cmd = table.concat({
-            'curl -s -G --retry 2 --max-time 8',
-            '"'..base..'"',
-            '--data-urlencode "client=gtx"',
-            '--data-urlencode "sl=ja"',
-            '--data-urlencode "tl=en"',
-            '--data-urlencode "dt=t"',
-            '--data-urlencode "q@'..qfile..'"'
-        }, ' ')
-        if cfg.debug then dbg('JA->EN executing curl (google)') end
-        local out, code = http_exec(cmd)
-        os.remove(qfile)
-        if cfg.debug then
-            dbg(string.format('google JA->EN http=%d', code))
-            dbg_raw('google JA->EN head: '..tostring(out or ''):sub(1,200))
-            if out and #out>0 then dbg_raw('google JA->EN hex:  '..hex_preview(out, 64)) end
-        end
-        if not out then return nil,'curl' end
-        if code ~= 200 or out == '' then return nil, 'http_'..tostring(code) end
-        out = unescape_json(out)
-        local ok, parsed = pcall(function() return json.decode(out) end)
-        if ok and parsed and type(parsed) == 'table' then
-            local primary = parsed[1] and parsed[1][1] and parsed[1][1][1]
-            if type(primary) == 'string' and is_mostly_ascii(primary) then
-                return remove_hex_artifacts(primary), nil
-            end
-            local candidate = find_best_string(parsed)
-            if candidate then
-                if not is_mostly_ascii(candidate) and contains_japanese(text) then
-                    local rom = kana_to_romaji(text)
-                    if rom and #rom>0 then return rom, nil end
-                end
-                return remove_hex_artifacts(candidate), nil
-            end
-            return nil, 'parse'
-        end
-        local parts = {}; for translated,_ in out:gmatch('%["(.-)","(.-)"') do parts[#parts+1]=translated end
-        if #parts == 0 then return nil, 'parse' end
-        return remove_hex_artifacts(table.concat(parts, '')), nil
-
+        return translate_google_ja_to_en(text)
     elseif cfg.provider == 'deepl' then
-        if cfg.api_key == '' then return nil, 'no_key' end
-        local data = 'auth_key='..urlencode(cfg.api_key)..'&text='..urlencode(text)..'&source_lang=JA&target_lang=EN'
-        local cmd = 'curl -s -X POST --retry 2 --max-time 10 -H "Content-Type: application/x-www-form-urlencoded" -d "'..data..'" "https://api-free.deepl.com/v2/translate"'
-        local out, code = http_exec(cmd)
-        if cfg.debug then
-            dbg(string.format('deepl JA->EN http=%d', code))
-            dbg_raw('deepl JA->EN head: '..tostring(out or ''):sub(1,200))
-            if out and #out>0 then dbg_raw('deepl JA->EN hex:  '..hex_preview(out, 64)) end
-        end
-        if not out then return nil, 'curl' end
-        if code ~= 200 or out == '' then return nil, 'http_'..tostring(code) end
-        out = unescape_json(out)
-        local t = out:match('%"text%":%s*%"(.-)%"')
-        if not t or #t == 0 then return nil, 'parse' end
-        return remove_hex_artifacts(t), nil
+        return translate_deepl_ja_to_en(text)
     end
     return nil, 'provider'
 end
@@ -559,53 +618,105 @@ end
 local function translate_en_to_ja(text)
     if not text then return '' end
     text = trim(text); if text == '' then return '' end
-
     if #text < 30 then
         local ph = phrasebook_match(text)
         if ph then return ph end
     end
-
-    local t, err
+    local t
     if cfg.provider == 'google' then
-        t, err = translate_google(text)
+        t = select(1, translate_google_en_to_ja(text))
     elseif cfg.provider == 'deepl' then
-        t, err = translate_deepl(text)
+        t = select(1, translate_deepl_en_to_ja(text))
     elseif cfg.provider == 'none' then
-        t, err = nil, 'none'
+        t = nil
     else
-        t, err = translate_google(text)
+        t = select(1, translate_google_en_to_ja(text))
     end
-
     if t and #t > 0 then
         t = trim(t)
-        if #t > 0 then
-            if cfg.debug then dbg(string.format('EN->JA ok: %s -> %s', text, t)) end
-            return t
+        if cfg.hiragana_mode then
+            t = katakana_to_hiragana(t)
         end
+        return t
     end
-    if cfg.debug then dbg(string.format('EN->JA failed: %s (err:%s)', text, err or 'unknown')) end
     return naive_fallback(text)
 end
 
--- ========== Optional: Kanji→Hiragana (instrumented; experimental) ==========
-local function to_hiragana(text)
-    if not text or text == '' then return text end
-    if cfg.api_key == '' then return text end
-    local payload = '{"q": '..('"%s"'):format(text:gsub('\\','\\\\'):gsub('"','\\"'))..',"source":"ja","target":"ja","format":"text"}'
-    local tmp = write_temp_utf8(payload)
-    if not tmp then return text end
-    local url = 'https://translation.googleapis.com/language/translate/v2?key='..urlencode(cfg.api_key)
-    local cmd = ('curl -s -X POST --retry 1 --max-time 6 -H "Content-Type: application/json; charset=utf-8" --data-binary "@%s" "%s"'):format(tmp, url)
-    local out, code = http_exec(cmd)
-    os.remove(tmp)
-    if cfg.debug then
-        dbg(string.format('hiragana http=%d', code))
-        dbg_raw('hiragana head: '..tostring(out or ''):sub(1,200))
-        if out and #out>0 then dbg_raw('hiragana hex:  '..hex_preview(out, 64)) end
+-- ========== Furigana APIs (optional logger) ==========
+local function furigana_via_goo(text_utf8)
+    local key = (cfg.furigana and cfg.furigana.app_id) or ''
+    if key == '' then return nil, 'no_key' end
+    local payload = string.format('{"app_id":"%s","sentence":"%s","output_type":"hiragana"}',
+        key:gsub('\\','\\\\'):gsub('"','\\"'),
+        (text_utf8 or ''):gsub('\\','\\\\'):gsub('"','\\"'))
+    local tmp = write_temp_json(payload); if not tmp then return nil, 'tmpfile' end
+    local cmd = ('curl -s -X POST --retry 1 --max-time 6 -H "Content-Type: application/json; charset=utf-8" --data-binary "@%s" "https://labs.goo.ne.jp/api/hiragana"'):format(tmp)
+    local out, code = http_exec(cmd); os.remove(tmp)
+    if not out or code ~= 200 then return nil, 'http_'..tostring(code) end
+    out = unescape_json(out)
+    local ok, obj = pcall(json.decode, out)
+    if not ok or type(obj) ~= 'table' then
+        local t = out:match('%"converted%":%s*%"(.-)%"')
+        if t and #t>0 then return sanitize_lines(t), nil end
+        return nil, 'parse'
     end
-    if not out or code ~= 200 then return text end
-    local t = out:match('%"translatedText%":%s*%"(.-)%"')
-    return t or text
+    local t = obj['converted']
+    if type(t) ~= 'string' then return nil, 'parse' end
+    return sanitize_lines(t), nil
+end
+
+local function furigana_via_yahoo(text_utf8)
+    local key = (cfg.furigana and cfg.furigana.app_id) or ''
+    if key == '' then return nil, 'no_key' end
+    local payload = string.format('{"id":"oddjp-1","jsonrpc":"2.0","method":"jlp.furiganaservice.furigana","params":{"q":"%s","grade":1}}',
+        (text_utf8 or ''):gsub('\\','\\\\'):gsub('"','\\"'))
+    local tmp = write_temp_json(payload); if not tmp then return nil, 'tmpfile' end
+    local cmd = ('curl -s -X POST --retry 1 --max-time 6 ' ..
+                 '-H "Content-Type: application/json; charset=utf-8" ' ..
+                 '-H "User-Agent: Yahoo AppID: %s" ' ..
+                 '--data-binary "@%s" "https://jlp.yahooapis.jp/FuriganaService/V2/furigana"')
+                 :format(key, tmp)
+    local out, code = http_exec(cmd); os.remove(tmp)
+    if not out or code ~= 200 then return nil, 'http_'..tostring(code) end
+    out = unescape_json(out)
+    local ok, obj = pcall(json.decode, out); if not ok or type(obj) ~= 'table' then return nil, 'parse' end
+    local result = obj['result'] or obj['Result'] or obj['resultset'] or obj['resultSet'] or obj
+    local out_words = {}
+    local function push(s) if type(s)=='string' and #s>0 then out_words[#out_words+1] = s end end
+    local function use_item(w)
+        if type(w) ~= 'table' then return end
+        if w['subword'] and type(w['subword'])=='table' then
+            for _,sw in ipairs(w['subword']) do
+                local f = sw['furigana'] or sw['Furigana'] or sw['surface'] or sw['Surface']
+                push(f)
+            end
+        else
+            local f = w['furigana'] or w['Furigana'] or w['surface'] or w['Surface']
+            push(f)
+        end
+    end
+    local wordlist = (result and result['word']) or obj['word']
+    if type(wordlist) == 'table' then
+        for _,w in ipairs(wordlist) do use_item(w) end
+    else
+        local function deep(v)
+            if type(v) ~= 'table' then return end
+            if v['surface'] or v['Surface'] then use_item(v); return end
+            for _,nv in pairs(v) do deep(nv) end
+        end
+        deep(obj)
+    end
+    if #out_words == 0 then return nil, 'empty' end
+    return sanitize_lines(table.concat(out_words, ' ')), nil
+end
+
+local function get_hiragana(text_utf8)
+    local prov = (cfg.furigana and cfg.furigana.provider) or 'goo'
+    if prov == 'yahoo' then
+        return furigana_via_yahoo(text_utf8)
+    else
+        return furigana_via_goo(text_utf8)
+    end
 end
 
 -- ========== Sending helpers ==========
@@ -620,15 +731,61 @@ local function queue_message(raw, channel, target)
     elseif channel == 'a' then cmd = 'alliance'
     elseif channel == 't' and target then cmd = 'tell ' .. target
     else return end
-    suppress_until = os.clock() + 0.2
+    suppress_until = os.clock() + 0.6
     AshitaCore:GetChatManager():QueueCommand(1, '/' .. cmd .. ' ' .. msg)
 end
 local function queue_p(raw) queue_message(raw, 'p') end
 local function queue_say(raw) queue_message(raw, 's') end
 local function queue_tell(name, raw) queue_message(raw, 't', name) end
 
+-- ========== Incoming processor ==========
+local function process_incoming(mode_num, raw_message)
+    if not raw_message or raw_message == '' then return nil end
+
+    local msg_game = strip_ashita_codes(raw_message)
+    local just_text = msg_game
+    local prefix = ''
+    while true do
+        local br = just_text:match('^%s*(%b[])')
+        if br then prefix = prefix .. br .. ' '; just_text = just_text:sub(#br + 1)
+        else
+            local ang = just_text:match('^%s*(%b<>)')
+            if ang then prefix = prefix .. ang .. ' '; just_text = just_text:sub(#ang + 1)
+            else break end
+        end
+    end
+    just_text = just_text:gsub('^%s+', '')
+
+    local text_utf8 = ensure_utf8(just_text)
+    if not cfg.translate_incoming then return nil end
+
+    local channel_map = { s=4, p=0x17, l=1, l2=14, t=3 }
+    local mode_base = bit.band(tonumber(mode_num) or 0, 0xFF)
+    local expected_mode = channel_map[(cfg.default_channel or 'p'):lower()]
+    local should_process = (expected_mode and mode_base == expected_mode) or cfg.translate_modes[mode_base] or cfg.translate_modes[mode_num]
+    if not should_process then return nil end
+
+    -- SKIP: FFXI autotranslate tokens entirely
+    if looks_like_ffxi_autotranslate(text_utf8) then return nil end
+
+    if not contains_japanese(text_utf8) then return nil end
+
+    local en = select(1, translate_ja_to_en(text_utf8))
+    if not en then return nil end
+
+    info(text_utf8 .. ' > ' .. en)
+
+    if cfg.furigana and cfg.furigana.enabled then
+        local hira = select(1, get_hiragana(text_utf8))
+        if hira and #hira > 0 then info(hira) end
+    end
+
+    local reinject = prefix .. just_text .. ' [' .. en .. ']'
+    return reinject, en, text_utf8
+end
+
 -- ========== Commands / Auto ==========
-local function split_words(s) local t={}; for w in s:gmatch('%S+') do t[#t+1]=w end; return t end
+local function split_words(s) local t={}; if type(s)~='string' then return t end for w in s:gmatch('%S+') do t[#t+1]=w end; return t end
 local last_auto_send = 0
 
 ashita.events.register('command','oddjp_command', function(e)
@@ -662,8 +819,9 @@ ashita.events.register('command','oddjp_command', function(e)
             local t=cmd:match('^/oddjp%s+test%s+(.+)$'); if not t then info('Usage: /oddjp test <text>'); return end
             local ja=translate_en_to_ja(t); info('EN: '..t); info('JA: '..ja); return
         elseif sub=='status' then
-            info(('enabled=%s, dual=%s, provider=%s, sendenc=%s, rate_ms=%d, debug=%s'):format(
-                tostring(cfg.enabled), tostring(cfg.dual_send), cfg.provider, cfg.send_encoding, cfg.rate_ms, tostring(cfg.debug)))
+            info(('enabled=%s, dual=%s, provider=%s, sendenc=%s, rate_ms=%d, debug=%s, furi=%s/%s'):format(
+                tostring(cfg.enabled), tostring(cfg.dual_send), cfg.provider, cfg.send_encoding, cfg.rate_ms, tostring(cfg.debug),
+                tostring(cfg.furigana and cfg.furigana.enabled), cfg.furigana and cfg.furigana.provider or ''))
             return
         elseif sub=='debug' then
             local v=(args[3] or ''):lower()
@@ -677,7 +835,7 @@ ashita.events.register('command','oddjp_command', function(e)
             return
         elseif sub=='hiragana' then
             local v=(args[3] or ''):lower()
-            if v=='on' or v=='true' then cfg.hiragana_mode=true; settings.save(); info('Hiragana mode: ON')
+            if v=='on' or v=='true' then cfg.hiragana_mode=true; settings.save(); info('Hiragana mode (outbound EN->JA): ON')
             elseif v=='off' or v=='false' then cfg.hiragana_mode=false; settings.save(); info('Hiragana mode: OFF') end
             return
         elseif sub=='channel' then
@@ -685,13 +843,45 @@ ashita.events.register('command','oddjp_command', function(e)
             if valid_channels[ch] then cfg.default_channel=ch; settings.save(); info('Default channel set to: /' .. ch)
             else info('Valid channels: /s /t /l /l2 /p /a') end
             return
+
+        elseif sub=='furigana' then
+            local v=(args[3] or ''):lower()
+            if v=='on' or v=='true' then
+                cfg.furigana.enabled = true; settings.save(); info('Furigana logger: ON'); return
+            elseif v=='off' or v=='false' then
+                cfg.furigana.enabled = false; settings.save(); info('Furigana logger: OFF'); return
+            elseif v=='provider' then
+                local p=(args[4] or ''):lower()
+                if p=='yahoo' or p=='goo' then cfg.furigana.provider = p; settings.save(); info('Furigana provider: '..p)
+                else info('Usage: /oddjp furigana provider yahoo|goo') end
+                return
+            elseif v=='key' then
+                local k=cmd:match('^/oddjp%s+furigana%s+key%s+(.+)$'); if not k then info('Usage: /oddjp furigana key <APP_ID>'); return end
+                cfg.furigana.app_id = trim(k); settings.save(); info('Furigana key set.'); return
+            else
+                info('Furigana: on|off | provider yahoo|goo | key <APP_ID>'); return
+            end
+
+        elseif sub=='inc' then
+            local simulated_mode = 0x17 -- party
+            local simulated_raw  = '[17] <OddFriend> おはよう'
+            if cfg.debug then dbg('Manual incoming injection: mode=0x17 text="おはよう"') end
+            local newmsg, en, orig = process_incoming(simulated_mode, simulated_raw)
+            if en then
+                info((orig or '??') .. ' > ' .. en)
+                info('Injected preview: ' .. (newmsg or simulated_raw))
+            else
+                info('Injection produced no translation (check incoming settings / mode filters).')
+            end
+            return
+
         else
-            info('Commands: on|off | dual on|off | provider google|deepl|none | key <KEY> | sendenc sjis|utf8 | channel <s|t|l|l2|p|a> | test <text> | status | debug on|off | incoming on|off | hiragana on|off')
+            info('Commands: on|off | dual on|off | provider google|deepl|none | key <KEY> | sendenc sjis|utf8 | channel <s|t|l|l2|p|a> | test <text> | status | debug on|off | incoming on|off | hiragana on|off | furigana on|off | furigana provider yahoo|goo | furigana key <APP_ID> | inc')
             return
         end
     end
 
-    -- Quick senders
+    -- Quick senders (outbound EN->JA)
     if starts_with_ci(cmd, '/jp ') then
         e.blocked=true
         local text=trim(cmd:match('^/jp%s+(.+)$') or ''); if #text==0 then return end
@@ -728,80 +918,17 @@ end)
 ashita.events.register('text_in','oddjp_text_in', function(e)
     if not e or not e.message then return end
     if e.injected or os.clock() < suppress_until then return end
-
-    local raw = e.message
-    local msg = raw:gsub('\30%d',''):gsub('\31%d','')
-    msg = msg:gsub('[%z\1-\8\11\12\14-\31]', '')
-
-    local prefix, speaker = '', nil
-    while true do
-        local br = msg:match('^%s*(%b[])')
-        if br then prefix = prefix .. br .. ' '; msg = msg:sub(#br + 1)
-        else
-            local ang = msg:match('^%s*(%b<>)')
-            if ang then local name = ang:sub(2, -2); if name ~= '' then speaker = name end; prefix = prefix .. ang .. ' '; msg = msg:sub(#ang + 1)
-            else break end
-        end
-    end
-    msg = msg:gsub('^%s+', '')
-    local cleaned = msg
-
-    if not cfg.translate_incoming then return end
-
-    local channel_map = { s=4, p=0x17, l=1, l2=14, t=3 }
-    local mode = e.mode or 0
-    local default_ch = (cfg.default_channel or 'p'):lower()
-    local expected_mode = channel_map[default_ch]
-    local mode_num = tonumber(mode) or 0
-    local mode_base = (mode_num >= 200) and (mode_num - 200) or mode_num
-    mode_base = mode_base % 256
-
-    local should_process = expected_mode and (mode_base == expected_mode) or (cfg.translate_modes[mode_base] or cfg.translate_modes[mode])
-
-    local numeric_tag = prefix:match('%[(%d+)%]')
-    if not should_process and numeric_tag then
-        local n = tonumber(numeric_tag)
-        if default_ch == 'l' and n == 1 then should_process = true end
-        if default_ch == 'l2' and n == 2 then should_process = true end
-    end
-
-    if cfg.debug then
-        dbg(string.format('Incoming: mode=%s (base=%s) default_ch=%s expected=%s incoming_on=%s',
-            tostring(mode), tostring(mode_base), tostring(default_ch), tostring(expected_mode), tostring(cfg.translate_incoming)))
-        dbg_raw('Cleaned preview: '..(cleaned:sub(1,80)))
-    end
-
-    if not should_process then return end
-
-    local has_jp = contains_japanese(cleaned)
-    if cfg.debug then
-        dbg('contains_japanese=' .. tostring(has_jp))
-        dbg('provider=' .. tostring(cfg.provider) .. ', api_key_set=' .. tostring(cfg.api_key ~= ''))
-    end
-    if not has_jp then return end
-
-    if cfg.debug then dbg_raw('JA->EN call for: '..tostring(cleaned:sub(1,200))) end
-    local en, err = translate_ja_to_en(cleaned)
-    if cfg.debug then dbg('JA->EN returned err='..tostring(err)) end
-    if cfg.debug and en then dbg_raw('JA->EN result: '..tostring(en)) end
-    if not en then
-        if cfg.debug then dbg(string.format('Incoming translation failed: (err: %s)', err or 'unknown')) end
-        return
-    end
-    if en and en ~= cleaned then
-        if cfg.debug then dbg('Final translation: ' .. tostring(en)) end
-        info('Translation: ' .. en)
-        local ok_assign, err_assign = pcall(function() e.message = prefix .. msg .. ' [' .. en .. ']' end)
-        if not ok_assign and cfg.debug then dbg('Failed to assign e.message: '..tostring(err_assign)) end
-    end
+    local newmsg, en = process_incoming(e.mode, e.message)
+    if not newmsg or not en then return end
+    local ok_assign, err_assign = pcall(function() e.message = newmsg end)
+    if not ok_assign and cfg.debug then dbg('Failed to assign e.message: '..tostring(err_assign)) end
 end)
 
 -- ========== Load / Unload ==========
 ashita.events.register('load','oddjp_load', function()
-    info(string.format('Loaded. Auto=%s, Dual=%s, Channel=%s, Provider=%s, SendEnc=%s',
-        tostring(cfg.enabled), tostring(cfg.dual_send), cfg.default_channel, cfg.provider, cfg.send_encoding))
-    if cfg.debug then
-        dbg('Instrumentation active: http status/head/hex logging enabled')
-    end
+    info(string.format('Loaded. Auto=%s, Dual=%s, Channel=%s, Provider=%s, SendEnc=%s, Furi=%s/%s',
+        tostring(cfg.enabled), tostring(cfg.dual_send), cfg.default_channel, cfg.provider, cfg.send_encoding,
+        tostring(cfg.furigana and cfg.furigana.enabled), cfg.furigana and cfg.furigana.provider or ''))
+    if cfg.debug then dbg('Incoming JP→EN; hardened against FFXI autotranslate tokens.') end
 end)
 ashita.events.register('unload','oddjp_unload', function() end)
